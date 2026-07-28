@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Steam 评论爬虫 — 
+===========================================
+
+用法：
+  python crawler.py --mode full
+  python crawler.py --mode incremental
+  python crawler.py --mode full --language schinese --max_pages 10
+
+输出：raw_reviews.csv（展平为 CSV 表格）
+"""
+
+import sys
+import os
+import time
+import csv
+import logging
+import argparse
+from datetime import datetime, timezone
+from typing import Optional
+
+import requests
+
+# ── 项目配置 ──────────────────────────────────────────
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import (
+    STEAM_APP_ID, STEAM_API,
+    REQUEST_INTERVAL, NUM_PER_PAGE, MAX_RETRIES, RETRY_BACKOFF,
+    INCREMENTAL_DAYS, HTTP_PROXIES, CURSOR_FILE,
+)
+
+# ── 输出文件 ──────────────────────────────────────────
+ROOT = os.path.dirname(os.path.abspath(__file__))
+RAWFILE = os.path.join(ROOT, "crawler", "raw_reviews.csv")
+os.makedirs(os.path.dirname(RAWFILE), exist_ok=True)
+# CURSOR_FILE 也放入同名文件夹
+CURSOR_FILE = os.path.join(ROOT, "crawler", "cursor.txt")
+
+# ── 日志 ──────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("crawler")
+
+
+class SteamReviewCrawler:
+    """Steam 评论爬虫 — 游标分页 + 指数退避重试"""
+
+    def __init__(self, app_id: int = STEAM_APP_ID,
+                 language: str = "all", day_range: int = 0,
+                 cursor: str = "*", proxies: Optional[dict] = None):
+        self.app_id = app_id
+        self.params = {
+            "json": 1,
+            "filter": "recent",
+            "language": language,
+            "review_type": "all",
+            "purchase_type": "all",
+            "day_range": day_range,
+            "cursor": cursor,
+            "num_per_page": min(NUM_PER_PAGE, 100),
+        }
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+        })
+        if proxies:
+            self.session.proxies.update(proxies)
+
+    def _fetch_page(self) -> dict:
+        """请求一页，带指数退避重试"""
+        url = STEAM_API.format(appid=self.app_id)
+        last_exc = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = self.session.get(url, params=self.params, timeout=30)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.RequestException as exc:
+                last_exc = exc
+                wait = RETRY_BACKOFF ** attempt
+                log.warning("第 %d 次请求失败: %s，%0.1fs 后重试",
+                            attempt, exc, wait)
+                time.sleep(wait)
+        raise RuntimeError(f"请求失败，已重试 {MAX_RETRIES} 次") from last_exc
+
+    def crawl(self, max_pages: int = 0, max_reviews: int = 0):
+        """生成器，逐条 yield 原始 JSON dict"""
+        page_count = 0
+        total_yielded = 0
+
+        while True:
+            if max_pages > 0 and page_count >= max_pages:
+                log.info("已达到最大页数 %d，停止", max_pages)
+                break
+            if max_reviews > 0 and total_yielded >= max_reviews:
+                log.info("已达到最大评论数 %d，停止", max_reviews)
+                break
+
+            data = self._fetch_page()
+            reviews_raw = data.get("reviews", [])
+            if not reviews_raw:
+                log.info("无更多评论；已爬取 %d 页 / %d 条", page_count, total_yielded)
+                break
+
+            page_count += 1
+            qs = data.get("query_summary", {})
+            log.info("页 %d | 本页 %d 条 | 总计 %s 条评论",
+                     page_count, len(reviews_raw),
+                     qs.get("total_reviews", "?"))
+
+            for item in reviews_raw:
+                if max_reviews > 0 and total_yielded >= max_reviews:
+                    break
+                # 注入 app_id 和 crawled_at
+                item["_app_id"] = self.app_id
+                item["_crawled_at"] = datetime.now(timezone.utc).isoformat()
+                total_yielded += 1
+                yield item
+
+            next_cursor = data.get("cursor")
+            if not next_cursor:
+                log.info("无下一页 cursor；结束")
+                break
+            self.params["cursor"] = next_cursor
+
+            # 断点续传
+            try:
+                with open(CURSOR_FILE, "w") as f:
+                    f.write(next_cursor)
+            except OSError:
+                pass
+
+            time.sleep(REQUEST_INTERVAL)
+
+def _convert_timestamps_in_csv(csv_path: str):
+    """将 CSV 中 Unix 时间戳列转换为 YYYY-MM-DD HH:MM 格式"""
+    from datetime import datetime, timezone
+
+    TS_COLS = {"timestamp_created", "timestamp_updated", "author_last_played"}
+
+    rows = []
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        if not fieldnames:
+            return
+        for row in reader:
+            for col in TS_COLS:
+                if col in row:
+                    val = row[col].strip()
+                    if val and val.isdigit() and len(val) >= 10:
+                        try:
+                            dt = datetime.fromtimestamp(int(val))
+                            row[col] = dt.strftime("%Y-%m-%d %H:%M")
+                        except (ValueError, OSError):
+                            pass
+            rows.append(row)
+
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+def run_crawl(mode: str = "full", language: str = "all",
+              max_pages: int = 0, max_reviews: int = 0,
+              proxies: Optional[dict] = None, resume: bool = True):
+    """爬取并写入 JSONL"""
+
+    day_range = 0 if mode == "full" else INCREMENTAL_DAYS
+
+    # 断点续传
+    start_cursor = "*"
+    if resume:
+        try:
+            with open(CURSOR_FILE, "r") as f:
+                saved = f.read().strip()
+                if saved:
+                    start_cursor = saved
+                    log.info("从断点恢复: cursor=%s...",
+                             saved[:40] if len(saved) > 40 else saved)
+        except FileNotFoundError:
+            pass
+
+    proxies = proxies or HTTP_PROXIES
+
+    log.info("=" * 60)
+    log.info("模式: %s | 语言: %s | day_range: %d | 输出: %s",
+             mode, language, day_range, RAWFILE)
+
+    crawler = SteamReviewCrawler(
+        app_id=STEAM_APP_ID, language=language,
+        day_range=day_range, cursor=start_cursor,
+        proxies=proxies,
+    )
+
+    # CSV 字段定义（展平 Steam 评论关键字段）
+    CSV_FIELDS = [
+        "recommendationid",
+        "author_steamid", "author_num_games_owned",
+        "author_num_reviews", "author_playtime_forever",
+        "author_playtime_last_two_weeks", "author_playtime_at_review",
+        "author_last_played",
+        "language", "review",
+        "timestamp_created", "timestamp_updated",
+        "voted_up", "votes_up", "votes_funny",
+        "weighted_vote_score", "comment_count",
+        "steam_purchase", "received_for_free",
+        "written_during_early_access",
+        "_app_id", "_crawled_at",
+    ]
+
+    def _flatten_item(item):
+        row = {}
+        for field in CSV_FIELDS:
+            if field.startswith("author_"):
+                author_key = field[len("author_"):]
+                row[field] = item.get("author", {}).get(author_key, "")
+            else:
+                val = item.get(field, "")
+                if field == "review" and isinstance(val, str):
+                    val = val.replace("\n", " ").replace("\r", " ")
+                row[field] = val
+        return row
+
+    file_exists = os.path.exists(RAWFILE) and os.path.getsize(RAWFILE) > 0
+    total = 0
+    try:
+        with open(RAWFILE, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+            if not file_exists:
+                writer.writeheader()
+            for item in crawler.crawl(max_pages=max_pages, max_reviews=max_reviews):
+                writer.writerow(_flatten_item(item))
+                total += 1
+                if total % 50 == 0:
+                    log.info("已写入 %d 条到 %s", total, RAWFILE)
+
+        # 成功完成，清除 cursor
+        try:
+            os.remove(CURSOR_FILE)
+        except (OSError, FileNotFoundError):
+            pass
+    except (KeyboardInterrupt, Exception):
+        log.warning("爬取中断，cursor 已保存；已写入 %d 条可恢复", total)
+        raise
+
+    # 爬取结束后自动转换时间戳
+    if total > 0:
+        log.info("正在转换时间戳...")
+        _convert_timestamps_in_csv(RAWFILE)
+
+    log.info("完成 — 共写入 %d 条评论到 %s", total, RAWFILE)
+    return total
+
+
+# ── CLI ────────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Steam 评论爬虫 → CSV")
+    parser.add_argument("--mode", choices=["full", "incremental"],
+                        default="incremental",
+                        help="全量或增量模式 (default: incremental)")
+    parser.add_argument("--language", default="all",
+                        help="评论语言筛选 (default: all)")
+    parser.add_argument("--max_pages", type=int, default=0,
+                        help="最大页数，0=不限 (default: 0)")
+    parser.add_argument("--max_reviews", type=int, default=0,
+                        help="最大评论数，0=不限 (default: 0)")
+    args = parser.parse_args()
+
+    run_crawl(
+        mode=args.mode,
+        language=args.language,
+        max_pages=args.max_pages,
+        max_reviews=args.max_reviews,
+    )
